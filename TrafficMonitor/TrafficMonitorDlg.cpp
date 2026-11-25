@@ -371,6 +371,7 @@ void CTrafficMonitorDlg::GetScreenSize()
 
 void CTrafficMonitorDlg::AutoSelect()
 {
+    CSingleLock lock(&m_conn_critical, TRUE);
     unsigned __int64 max_in_out_bytes{};
     unsigned __int64 in_out_bytes;
     //m_connection_selected = m_connections[0].index;
@@ -393,20 +394,57 @@ void CTrafficMonitorDlg::AutoSelect()
     m_connection_change_flag = true;
 }
 
+bool CTrafficMonitorDlg::ReloadIfTable()
+{
+    //不变式：m_dwSize恒等于m_pIfTable实际分配的字节数。
+    //GetIfTable的pdwSize是输入输出参数，返回ERROR_INSUFFICIENT_BUFFER时会把它改写成所需大小且不填充数据，
+    //因此每次调用都必须用局部变量接收，不能让它改写已分配的尺寸，否则下次调用会把缓冲区当成更大来写，破坏堆。
+    if (m_pIfTable == nullptr)
+    {
+        m_dwSize = sizeof(MIB_IFTABLE) + sizeof(MIB_IFROW) * 8;
+        m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
+        if (m_pIfTable == nullptr)
+        {
+            m_dwSize = 0;
+            return false;
+        }
+    }
+
+    for (int attempt = 0; attempt < 5; attempt++)
+    {
+        DWORD dwSize = m_dwSize;
+        DWORD rtn = ERROR_GEN_FAILURE;
+        __try
+        {
+            rtn = GetIfTable(m_pIfTable, &dwSize, FALSE);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            rtn = ERROR_GEN_FAILURE;
+        }
+        if (rtn == NO_ERROR)
+            return true;
+        if (rtn != ERROR_INSUFFICIENT_BUFFER)
+            return false;
+        //接口数量在两次调用之间发生了变化，按所需大小加余量重新分配后再试
+        DWORD new_size = dwSize + sizeof(MIB_IFROW) * 8;
+        MIB_IFTABLE* pNewTable = (MIB_IFTABLE*)malloc(new_size);
+        if (pNewTable == nullptr)
+            return false;
+        free(m_pIfTable);
+        m_pIfTable = pNewTable;
+        m_dwSize = new_size;
+    }
+    return false;
+}
+
 void CTrafficMonitorDlg::IniConnection()
 {
-    //为m_pIfTable开辟所需大小的内存
-    free(m_pIfTable);
-    m_dwSize = sizeof(MIB_IFTABLE);
-    m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
-    int rtn;
-    rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-    if (rtn == ERROR_INSUFFICIENT_BUFFER)	//如果函数返回值为ERROR_INSUFFICIENT_BUFFER，说明m_pIfTable的大小不够
-    {
-        free(m_pIfTable);
-        m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);	//用新的大小重新开辟一块内存
-    }
-    GetIfTable(m_pIfTable, &m_dwSize, FALSE);
+    CSingleLock lock(&m_conn_critical, TRUE);
+    //重新获取接口表；失败时保留原有表继续使用，不再把失效的尺寸传给API
+    ReloadIfTable();
+    if (m_pIfTable == nullptr)
+        return;
 
     //获取当前所有的连接，并保存到m_connections容器中
     if (!theApp.m_general_data.show_all_interface)
@@ -497,10 +535,19 @@ void CTrafficMonitorDlg::IniConnection()
 
 MIB_IFROW CTrafficMonitorDlg::GetConnectIfTable(int connection_index)
 {
-    if (connection_index >= 0 && connection_index < static_cast<int>(m_connections.size()))
+    CSingleLock lock(&m_conn_critical, TRUE);
+    if (connection_index >= 0 && connection_index < static_cast<int>(m_connections.size()) && m_pIfTable != nullptr)
     {
+        //接口在IfTable中的位置会随网卡增删而改变，优先按dwIndex（接口索引）匹配，
+        //匹配不到时才退回按下标匹配，避免表序变化后读到别的网卡（表现为网速恒为0）
+        DWORD if_index = m_connections[connection_index].if_index;
+        for (DWORD i{}; i < m_pIfTable->dwNumEntries; i++)
+        {
+            if (m_pIfTable->table[i].dwIndex == if_index)
+                return m_pIfTable->table[i];
+        }
         int index = m_connections[connection_index].index;
-        if (m_pIfTable != nullptr && index >= 0 && index < m_pIfTable->dwNumEntries)
+        if (index >= 0 && index < static_cast<int>(m_pIfTable->dwNumEntries))
             return m_pIfTable->table[index];
     }
     return MIB_IFROW();
@@ -508,6 +555,7 @@ MIB_IFROW CTrafficMonitorDlg::GetConnectIfTable(int connection_index)
 
 NetWorkConection CTrafficMonitorDlg::GetConnection(int connection_index)
 {
+    CSingleLock lock(&m_conn_critical, TRUE);
     if (connection_index >= 0 && connection_index < static_cast<int>(m_connections.size()))
         return m_connections[connection_index];
     else
@@ -516,6 +564,7 @@ NetWorkConection CTrafficMonitorDlg::GetConnection(int connection_index)
 
 void CTrafficMonitorDlg::IniConnectionMenu(CMenu* pMenu)
 {
+    CSingleLock lock(&m_conn_critical, TRUE);
     ASSERT(pMenu != nullptr);
     if (pMenu != nullptr)
     {
@@ -548,6 +597,7 @@ void CTrafficMonitorDlg::IniTaskBarConnectionMenu()
 
 void CTrafficMonitorDlg::SetConnectionMenuState(CMenu* pMenu)
 {
+    CSingleLock lock(&m_conn_critical, TRUE);
     if (theApp.m_cfg_data.m_select_all)
         pMenu->CheckMenuRadioItem(0, m_connections.size() + 1, 1, MF_BYPOSITION | MF_CHECKED);
     else if (theApp.m_cfg_data.m_auto_select)       //m_auto_select为true时为自动选择，选中菜单的第1项
@@ -1202,28 +1252,23 @@ static int GetMonitorTimerCount(int second)
 void CTrafficMonitorDlg::DoMonitorAcquisition()
 {
     //获取网络连接速度
-    int rtn{};
-    auto getLfTable = [&]() {
-        __try
-        {
-            rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            free(m_pIfTable);
-            m_dwSize = sizeof(MIB_IFTABLE);
-            m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
-            rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-            if (rtn == ERROR_INSUFFICIENT_BUFFER)	//如果函数返回值为ERROR_INSUFFICIENT_BUFFER，说明m_pIfTable的大小不够
-            {
-                free(m_pIfTable);
-                m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);	//用新的大小重新开辟一块内存
-            }
-            GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-        }
-    };
-
-    getLfTable();
+    bool if_table_ok = false;
+    {
+        CSingleLock lock(&m_conn_critical, TRUE);
+        if_table_ok = ReloadIfTable();
+    }
+    if (if_table_ok)
+    {
+        m_if_table_fail_cnt = 0;
+    }
+    else if (++m_if_table_fail_cnt >= 3)    //连续失败时重建一次连接列表；失败期间沿用旧表，不清零上一次的字节数
+    {
+        m_if_table_fail_cnt = 0;
+        IniConnection();
+        CString info = CCommon::LoadText(IDS_INSUFFICIENT_BUFFER);
+        info.Replace(_T("<%cnt%>"), CCommon::IntToString(m_restart_cnt));
+        CCommon::WriteLog(info, theApp.m_log_path.c_str());
+    }
 
     if (!theApp.m_cfg_data.m_select_all)        //获取当前选中连接的网速
     {
@@ -1344,14 +1389,6 @@ void CTrafficMonitorDlg::DoMonitorAcquisition()
                 last_today_kbytes = current_kbytes;
             }
         }
-    }
-
-    if (rtn == ERROR_INSUFFICIENT_BUFFER)
-    {
-        IniConnection();
-        CString info = CCommon::LoadText(IDS_INSUFFICIENT_BUFFER);
-        info.Replace(_T("<%cnt%>"), CCommon::IntToString(m_restart_cnt));
-        CCommon::WriteLog(info, theApp.m_log_path.c_str());
     }
 
     if (m_monitor_time_cnt % GetMonitorTimerCount(3) == GetMonitorTimerCount(3) - 1)
@@ -2126,7 +2163,23 @@ void CTrafficMonitorDlg::OnNetworkInfo()
 {
     // TODO: 在此添加命令处理程序代码
     //弹出“连接详情”对话框
-    CNetworkInfoDlg aDlg(m_connections, m_pIfTable->table, m_connection_selected);
+    //对话框是模态的、存活时间长，期间监控线程可能重新分配接口表，因此先做快照，避免悬空指针
+    vector<NetWorkConection> connections;
+    vector<MIB_IFROW> if_rows;
+    int connection_selected = 0;
+    {
+        CSingleLock lock(&m_conn_critical, TRUE);
+        if (m_pIfTable == nullptr)
+            return;
+        connections = m_connections;
+        if_rows.assign(m_pIfTable->table, m_pIfTable->table + m_pIfTable->dwNumEntries);
+        connection_selected = m_connection_selected;
+    }
+    if (if_rows.empty())
+        return;
+    if (connection_selected < 0 || connection_selected >= static_cast<int>(connections.size()))
+        connection_selected = 0;
+    CNetworkInfoDlg aDlg(connections, if_rows, connection_selected);
     ////向CNetworkInfoDlg类传递自启动以来已发送和接收的字节数
     //aDlg.m_in_bytes = m_pIfTable->table[m_connections[m_connection_selected].index].dwInOctets - m_connections[m_connection_selected].in_bytes;
     //aDlg.m_out_bytes = m_pIfTable->table[m_connections[m_connection_selected].index].dwOutOctets - m_connections[m_connection_selected].out_bytes;

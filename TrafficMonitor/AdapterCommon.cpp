@@ -85,13 +85,22 @@ void CAdapterCommon::GetIfTableInfo(vector<NetWorkConection>& adapters, MIB_IFTA
 		index = FindConnectionInIfTable(adapters[i].description, pIfTable);
 		if (index == -1)		//如果使用精确匹配的方式没有找到，则采用模糊匹配的方式再查找一次
 			index = FindConnectionInIfTableFuzzy(adapters[i].description, pIfTable);
-		//if (index != -1)
-		//{
-		adapters[i].index = index;
-		adapters[i].in_bytes = pIfTable->table[index].dwInOctets;
-		adapters[i].out_bytes = pIfTable->table[index].dwOutOctets;
-		adapters[i].description_2 = (const char*)pIfTable->table[index].bDescr;
-		//}
+		if (index >= 0 && index < static_cast<int>(pIfTable->dwNumEntries))
+		{
+			adapters[i].index = index;
+			adapters[i].if_index = pIfTable->table[index].dwIndex;
+			adapters[i].in_bytes = pIfTable->table[index].dwInOctets;
+			adapters[i].out_bytes = pIfTable->table[index].dwOutOctets;
+			adapters[i].description_2 = (const char*)pIfTable->table[index].bDescr;
+		}
+		else    //没有匹配到任何接口时不能去读table[-1]，保持连接信息有效，避免越界读取
+		{
+			adapters[i].index = -1;
+			adapters[i].if_index = 0;
+			adapters[i].in_bytes = 0;
+			adapters[i].out_bytes = 0;
+			adapters[i].description_2.clear();
+		}
 	}
 }
 
@@ -105,6 +114,7 @@ void CAdapterCommon::GetAllIfTableInfo(vector<NetWorkConection>& adapters, MIB_I
 		NetWorkConection connection;
 		connection.description = connection.description_2 = (const char*)pIfTable->table[i].bDescr;
 		connection.index = i;
+		connection.if_index = pIfTable->table[i].dwIndex;
 		connection.in_bytes = pIfTable->table[i].dwInOctets;
 		connection.out_bytes = pIfTable->table[i].dwOutOctets;
 		for (size_t j{}; j < adapters_tmp.size(); j++)
@@ -148,7 +158,7 @@ int CAdapterCommon::FindConnectionInIfTableFuzzy(string connection, MIB_IFTABLE*
 	}
 	//如果还是没有找到，则使用字符串匹配算法查找
 	double max_degree{};
-	int best_index{};
+	int best_index{ -1 };
 	for (size_t i{}; i < pIfTable->dwNumEntries; i++)
 	{
 		string descr = (const char*)pIfTable->table[i].bDescr;

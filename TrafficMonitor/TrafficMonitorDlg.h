@@ -7,6 +7,7 @@
 
 #include "NetworkInfoDlg.h"
 #include "afxwin.h"
+#include <afxmt.h>
 #include "StaticEx.h"
 #include "Common.h"
 #include "TaskBarDlg.h"
@@ -58,8 +59,10 @@ protected:
     CTaskBarDlg* m_tBarDlg{};     //任务栏窗口的指针
 
     vector<NetWorkConection> m_connections; //保存获取到的要显示到“选择网卡”菜单项中的所有网络连接
-    MIB_IFTABLE* m_pIfTable;
-    DWORD m_dwSize{};	//m_pIfTable的大小
+    MIB_IFTABLE* m_pIfTable{ nullptr };
+    DWORD m_dwSize{};	//m_pIfTable实际分配的字节数（恒等于malloc的大小）
+    CCriticalSection m_conn_critical;   //用于保护m_pIfTable/m_dwSize/m_connections及相关索引
+    int m_if_table_fail_cnt{};          //GetIfTable连续失败的次数
     int m_connection_selected{ 0 }; //要显示流量的连接的序号
     unsigned __int64 m_in_bytes{};        //当前已接收的字节数
     unsigned __int64 m_out_bytes{};   //当前已发送的字节数
@@ -153,6 +156,7 @@ protected:
     //void UpdateConnections();
     //自动选择连接
     void IniConnection();   //初始化连接
+    bool ReloadIfTable();   //重新获取接口表，保证m_dwSize与m_pIfTable的实际分配大小一致
 
     MIB_IFROW GetConnectIfTable(int connection_index);    //获取当前选择的网络连接的MIB_IFROW对象。connection_index为m_connections中的索引
     NetWorkConection GetConnection(int connection_index); //获取当前选择的网络连接的NetWorkConection对象。connection_index为m_connections中的索引
