@@ -394,6 +394,19 @@ void CTrafficMonitorDlg::AutoSelect()
     m_connection_change_flag = true;
 }
 
+//GetIfTable的异常保护单独放在这个函数里，避免__try与需要析构的对象出现在同一个函数中（C2712）
+static DWORD SafeGetIfTable(MIB_IFTABLE* pIfTable, DWORD* pSize)
+{
+    __try
+    {
+        return GetIfTable(pIfTable, pSize, FALSE);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return ERROR_GEN_FAILURE;
+    }
+}
+
 bool CTrafficMonitorDlg::ReloadIfTable()
 {
     //不变式：m_dwSize恒等于m_pIfTable实际分配的字节数。
@@ -413,21 +426,19 @@ bool CTrafficMonitorDlg::ReloadIfTable()
     for (int attempt = 0; attempt < 5; attempt++)
     {
         DWORD dwSize = m_dwSize;
-        DWORD rtn = ERROR_GEN_FAILURE;
-        __try
-        {
-            rtn = GetIfTable(m_pIfTable, &dwSize, FALSE);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            rtn = ERROR_GEN_FAILURE;
-        }
+        DWORD rtn = SafeGetIfTable(m_pIfTable, &dwSize);
         if (rtn == NO_ERROR)
             return true;
         if (rtn != ERROR_INSUFFICIENT_BUFFER)
             return false;
         //接口数量在两次调用之间发生了变化，按所需大小加余量重新分配后再试
         DWORD new_size = dwSize + sizeof(MIB_IFROW) * 8;
+        if (theApp.m_debug_log)
+        {
+            CString log_str;
+            log_str.Format(_T("GetIfTable缓冲区不足：%lu -> %lu字节，重新分配后重试\r\n"), m_dwSize, new_size);
+            CCommon::WriteLog(log_str, theApp.m_log_path.c_str());
+        }
         MIB_IFTABLE* pNewTable = (MIB_IFTABLE*)malloc(new_size);
         if (pNewTable == nullptr)
             return false;
@@ -1270,24 +1281,27 @@ void CTrafficMonitorDlg::DoMonitorAcquisition()
         CCommon::WriteLog(info, theApp.m_log_path.c_str());
     }
 
-    if (!theApp.m_cfg_data.m_select_all)        //获取当前选中连接的网速
     {
-        auto table = GetConnectIfTable(m_connection_selected);
-        m_in_bytes = table.dwInOctets;
-        m_out_bytes = table.dwOutOctets;
-    }
-    else        //获取全部连接的网速
-    {
-        m_in_bytes = 0;
-        m_out_bytes = 0;
-        for (size_t i{}; i < m_connections.size(); i++)
+        CSingleLock lock(&m_conn_critical, TRUE);
+        if (!theApp.m_cfg_data.m_select_all)        //获取当前选中连接的网速
         {
-            auto table = GetConnectIfTable(i);
-            //if (i > 0 && m_pIfTable->table[m_connections[i].index].dwInOctets == m_pIfTable->table[m_connections[i - 1].index].dwInOctets
-            //  && m_pIfTable->table[m_connections[i].index].dwOutOctets == m_pIfTable->table[m_connections[i - 1].index].dwOutOctets)
-            //  continue;       //连接列表中可能会有相同的连接，统计所有连接的网速时，忽略掉已发送和已接收字节数完全相同的连接
-            m_in_bytes += table.dwInOctets;
-            m_out_bytes += table.dwOutOctets;
+            auto table = GetConnectIfTable(m_connection_selected);
+            m_in_bytes = table.dwInOctets;
+            m_out_bytes = table.dwOutOctets;
+        }
+        else        //获取全部连接的网速
+        {
+            m_in_bytes = 0;
+            m_out_bytes = 0;
+            for (size_t i{}; i < m_connections.size(); i++)
+            {
+                auto table = GetConnectIfTable(i);
+                //if (i > 0 && m_pIfTable->table[m_connections[i].index].dwInOctets == m_pIfTable->table[m_connections[i - 1].index].dwInOctets
+                //  && m_pIfTable->table[m_connections[i].index].dwOutOctets == m_pIfTable->table[m_connections[i - 1].index].dwOutOctets)
+                //  continue;       //连接列表中可能会有相同的连接，统计所有连接的网速时，忽略掉已发送和已接收字节数完全相同的连接
+                m_in_bytes += table.dwInOctets;
+                m_out_bytes += table.dwOutOctets;
+            }
         }
     }
 
