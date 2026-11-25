@@ -1,0 +1,53 @@
+name: build-net-fix
+
+on:
+  push:
+    branches: [ fix/net-adapter-iftable ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sln: TrafficMonitor.sln
+            cfg: Release
+            out: Bin/x64/Release
+            name: standard-x64
+          - sln: TrafficMonitor_Lite.sln
+            cfg: Release (lite)
+            out: Bin/x64/Release (lite)
+            name: lite-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          msbuild -version
+          "commit: $env:GITHUB_SHA"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild "${{ matrix.sln }}" "-p:configuration=${{ matrix.cfg }}" "-p:platform=x64" "-p:platformToolset=v143" -m -verbosity:minimal
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          $out = "${{ matrix.out }}"
+          Copy-Item "$out/TrafficMonitor.exe" out/
+          Copy-Item "$out/*.dll" out/ -ErrorAction SilentlyContinue
+          Copy-Item "$out/*.pdb" out/ -ErrorAction SilentlyContinue
+          Get-ChildItem out | Select-Object Name, Length | Format-Table
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TrafficMonitor_${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
