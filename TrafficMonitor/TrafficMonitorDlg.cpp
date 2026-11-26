@@ -532,7 +532,10 @@ void CTrafficMonitorDlg::IniConnection()
     }
     if (m_connection_selected < 0 || m_connection_selected >= m_connections.size())
         m_connection_selected = 0;
-    theApp.m_cfg_data.m_connection_name = GetConnection(m_connection_selected).description_2;
+    //“选择全部”模式下 m_connection_selected 不参与统计，不能把它的名字回写到配置里，
+    //否则下面的“连接名称不匹配”检查会自己和自己比较，永远通过
+    if (!theApp.m_cfg_data.m_select_all)
+        theApp.m_cfg_data.m_connection_name = GetConnection(m_connection_selected).description_2;
 
     //根据已获取到的连接在菜单中添加相应项目
     IniConnectionMenu(theApp.m_main_menu.GetSubMenu(0)->GetSubMenu(0));      //向“选择网络连接”子菜单项添加项目
@@ -1342,6 +1345,45 @@ void CTrafficMonitorDlg::DoMonitorAcquisition()
     m_last_in_bytes = m_in_bytes;
     m_last_out_bytes = m_out_bytes;
 
+    //零速看门狗：监控覆盖到的字节数长时间不变，但整张接口表的字节数在增长，
+    //说明连接列表漏掉了正在跑流量的网卡（常见于开机/休眠后网卡还没就绪就建立了列表），
+    //此时重建一次连接列表。60秒内最多重建一次，避免频繁重建。
+    {
+        unsigned __int64 total_bytes = 0;
+        {
+            CSingleLock lock(&m_conn_critical, TRUE);
+            if (m_pIfTable != nullptr)
+            {
+                for (DWORD i{}; i < m_pIfTable->dwNumEntries; i++)
+                {
+                    total_bytes += static_cast<unsigned __int64>(m_pIfTable->table[i].dwInOctets);
+                    total_bytes += static_cast<unsigned __int64>(m_pIfTable->table[i].dwOutOctets);
+                }
+            }
+        }
+        static unsigned __int64 last_monitored_bytes{};
+        static unsigned __int64 last_total_bytes{};
+        unsigned __int64 monitored_bytes = m_in_bytes + m_out_bytes;
+        if (monitored_bytes == last_monitored_bytes && total_bytes > last_total_bytes + 64u * 1024u)
+            m_conn_stale_cnt++;
+        else
+            m_conn_stale_cnt = 0;
+        last_monitored_bytes = monitored_bytes;
+        last_total_bytes = total_bytes;
+
+        if (m_conn_stale_cnt >= GetMonitorTimerCount(15))
+        {
+            ULONGLONG now = CCommon::GetCurrentTimeSinceEpochMilliseconds();
+            if (m_last_conn_rebuild == 0 || now - m_last_conn_rebuild > 60000)
+            {
+                m_conn_stale_cnt = 0;
+                m_last_conn_rebuild = now;
+                IniConnection();
+                CCommon::WriteLog(_T("监控的网卡长时间没有字节变化，但系统总流量在增长，已重新获取连接。"), theApp.m_log_path.c_str());
+            }
+        }
+    }
+
     //处于自动选择状态时，如果连续30秒没有网速，则可能自动选择的网络不对，此时执行一次自动选择
     if (theApp.m_cfg_data.m_auto_select)
     {
@@ -1425,15 +1467,52 @@ void CTrafficMonitorDlg::DoMonitorAcquisition()
             last_interface_num = interface_num;
         }
 
+        //检查连接列表是否仍然有效：
+        //“选择全部”模式下，看列表有没有漏掉系统里现存的适配器（开机时网卡尚未就绪就会漏，
+        //漏掉后接口总数不变，下面的数量检查也不会触发，网速就一直为0）；
+        //单连接模式下，看选中那一行的名称和配置的是否一致。
+        bool connection_stale = false;
         string descr;
-        descr = (const char*)GetConnectIfTable(m_connection_selected).bDescr;
-        if (descr != theApp.m_cfg_data.m_connection_name)
+        if (theApp.m_cfg_data.m_select_all)
+        {
+            vector<NetWorkConection> adapters_now;
+            CAdapterCommon::GetAdapterInfo(adapters_now);
+            {
+                CSingleLock lock(&m_conn_critical, TRUE);
+                for (const auto& adapter : adapters_now)
+                {
+                    if (theApp.m_general_data.connections_hide.Contains(CCommon::StrToUnicode(adapter.description.c_str())))
+                        continue;
+                    bool found = false;
+                    for (const auto& conn : m_connections)
+                    {
+                        if (conn.description == adapter.description)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                    {
+                        connection_stale = true;
+                        descr = adapter.description;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            descr = (const char*)GetConnectIfTable(m_connection_selected).bDescr;
+            connection_stale = (descr != theApp.m_cfg_data.m_connection_name);
+        }
+        if (connection_stale)
         {
             //写入额外的调试信息
             if (theApp.m_debug_log)
             {
                 CString log_str;
-                log_str = _T("连接名称不匹配：\r\n");
+                log_str = _T("连接列表已失效：\r\n");
                 log_str += _T("IfTable description: ");
                 log_str += descr.c_str();
                 log_str += _T("\r\nm_connection_name: ");
